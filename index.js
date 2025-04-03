@@ -13,7 +13,7 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
-    res.send('Hello, MERN with ES6 Modules!');
+    res.send('Garmennt Cutting APplication Backend Running Successfully');
 });
 
 app.listen(PORT, () => {

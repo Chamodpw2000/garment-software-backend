@@ -14,7 +14,7 @@ export function optimizeGarmentCutting(req, res) {
   }));
 
   // Sort orders by quantity in descending order for better optimization
-  orderItems.sort((a, b) => b.quantity - a.quantity);
+  orderItems.sort((a, b) => b.quantity - a.remaining);
 
   const cuttingPlan = [];
   let cutNumber = 0;
@@ -30,140 +30,126 @@ export function optimizeGarmentCutting(req, res) {
       blocks: {}
     };
     
-    // First pass: Determine optimal stack size
-    // Start with the maximum allowed stack size
+    // Determine optimal stack size for this cut
+    // Default to maximum allowed
     let optimalStackSize = maxStackingCloth;
     
-    // Find the minimum stack size that makes sense for the largest remaining order
-    const largestRemainingOrder = orderItems.reduce(
-      (max, item) => item.remaining > max ? item.remaining : max, 
-      0
-    );
+    // Sort items by remaining quantity for this allocation
+    const sortedItems = [...orderItems]
+      .filter(item => item.remaining > 0)
+      .sort((a, b) => b.remaining - a.remaining);
     
-    // If the largest order is smaller than max stacking, adjust stack size
-    if (largestRemainingOrder < maxStackingCloth) {
-      optimalStackSize = largestRemainingOrder;
-    }
+    if (sortedItems.length === 0) break; // No more items to process
     
-    // Set the initial stack size
-    currentCut.stackSize = optimalStackSize;
-    
-    // Second pass: Allocate blocks optimally
+    // Allocate blocks based on remaining quantities
     let remainingBlocks = maxBlocksPerCut;
-    const sortedItems = [...orderItems].sort((a, b) => b.remaining - a.remaining);
+    let blocksAllocated = false;
     
+    // First pass: Allocate blocks to sizes with the most remaining items
     for (const item of sortedItems) {
       if (item.remaining > 0 && remainingBlocks > 0) {
-        // Calculate how many complete blocks we need for this size
-        // This explicitly considers using multiple blocks of the same size
-        const neededBlocks = Math.ceil(item.remaining / currentCut.stackSize);
+        // Calculate how many blocks we need for this size
+        // We want to use as many blocks as needed to fulfill the order
+        const idealBlocksNeeded = Math.ceil(item.remaining / maxStackingCloth);
         
         // Allocate as many blocks as we can, up to what's needed
-        const allocatedBlocks = Math.min(neededBlocks, remainingBlocks);
+        const blocksToAllocate = Math.min(idealBlocksNeeded, remainingBlocks);
         
-        if (allocatedBlocks > 0) {
-          currentCut.blocks[item.size] = allocatedBlocks;
-          remainingBlocks -= allocatedBlocks;
-          
-          // Calculate how many pieces we'll actually produce
-          const producedQuantity = allocatedBlocks * currentCut.stackSize;
-          
-          // Update remaining quantity, ensuring we don't go negative
-          item.remaining = Math.max(0, item.remaining - producedQuantity);
+        if (blocksToAllocate > 0) {
+          currentCut.blocks[item.size] = blocksToAllocate;
+          remainingBlocks -= blocksToAllocate;
+          blocksAllocated = true;
         }
       }
     }
     
-    // Third pass: If we have remaining blocks and items, try to use partial blocks
-    if (remainingBlocks > 0) {
-      // Re-sort by remaining quantity
-      const remainingItems = orderItems.filter(item => item.remaining > 0);
-      remainingItems.sort((a, b) => b.remaining - a.remaining);
-      
-      for (const item of remainingItems) {
-        if (remainingBlocks > 0 && item.remaining > 0) {
-          // If we already allocated blocks for this size, increase the count
-          if (currentCut.blocks[item.size]) {
-            currentCut.blocks[item.size]++;
-          } else {
-            currentCut.blocks[item.size] = 1;
-          }
-          
-          // Update remaining quantity and blocks
-          item.remaining = Math.max(0, item.remaining - currentCut.stackSize);
-          remainingBlocks--;
-        }
+    // If we couldn't allocate any blocks in the first pass, allocate at least one
+    // block to the item with the largest remaining quantity
+    if (!blocksAllocated && sortedItems.length > 0) {
+      const largestItem = sortedItems[0];
+      currentCut.blocks[largestItem.size] = 1;
+      remainingBlocks--;
+      blocksAllocated = true;
+    }
+    
+    // Second pass: Determine optimal stack size to minimize waste
+    // Start with the maximum allowed stack size
+    optimalStackSize = maxStackingCloth;
+    
+    // For each size in this cut, find the stack size that doesn't exceed the order
+    for (const [size, blocks] of Object.entries(currentCut.blocks)) {
+      const item = orderItems.find(i => i.size === size);
+      if (item) {
+        // Calculate the maximum stack size that won't exceed the order
+        const maxStackForItem = Math.ceil(item.remaining / blocks);
+        optimalStackSize = Math.min(optimalStackSize, maxStackForItem);
       }
     }
     
-    // Fourth pass: Optimize stack size to minimize waste
-    // Only if we've allocated blocks
-    if (Object.keys(currentCut.blocks).length > 0) {
-      // Calculate the optimal stack size that minimizes waste
-      let minWasteStackSize = currentCut.stackSize;
-      let minWaste = Number.MAX_SAFE_INTEGER;
-      
-      // Try different stack sizes to find the one with minimum waste
-      for (let testStackSize = 1; testStackSize <= currentCut.stackSize; testStackSize++) {
-        let waste = 0;
-        let canFulfillAllOrders = true;
-        
-        // Calculate waste for this stack size
-        for (const [size, blocks] of Object.entries(currentCut.blocks)) {
-          const originalOrder = orders[size];
-          const alreadyProduced = originalOrder - orderItems.find(item => item.size === size).remaining - (blocks * testStackSize);
-          
-          // If we can't fulfill the order with this stack size, it's not valid
-          if (alreadyProduced < 0) {
-            canFulfillAllOrders = false;
-            break;
-          }
-          
-          // Calculate potential waste (overproduction)
-          waste += Math.max(0, alreadyProduced);
-        }
-        
-        // If this stack size can fulfill all orders and has less waste, use it
-        if (canFulfillAllOrders && waste < minWaste) {
-          minWaste = waste;
-          minWasteStackSize = testStackSize;
-        }
-      }
-      
-      // Update the stack size to the optimal one
-      currentCut.stackSize = minWasteStackSize;
-      
-      // Update the remaining quantities based on the new stack size
-      for (const [size, blocks] of Object.entries(currentCut.blocks)) {
-        const item = orderItems.find(i => i.size === size);
+    // Ensure stack size is at least 1
+    currentCut.stackSize = Math.max(1, optimalStackSize);
+    
+    // Third pass: Update remaining quantities based on what we'll produce
+    for (const [size, blocks] of Object.entries(currentCut.blocks)) {
+      const item = orderItems.find(i => i.size === size);
+      if (item) {
+        // Calculate how many pieces we'll produce
         const producedQuantity = blocks * currentCut.stackSize;
         
-        // Find the original remaining before this cut
-        const originalRemaining = item.remaining + producedQuantity;
-        
-        // Update to the new remaining based on optimized stack size
-        item.remaining = Math.max(0, originalRemaining - (blocks * currentCut.stackSize));
+        // Update remaining quantity
+        item.remaining = Math.max(0, item.remaining - producedQuantity);
       }
     }
     
-    // If we couldn't allocate any blocks, handle edge case
-    if (Object.keys(currentCut.blocks).length === 0) {
-      // Find the item with the smallest remaining quantity
-      const smallestItem = orderItems
-        .filter(item => item.remaining > 0)
-        .sort((a, b) => a.remaining - b.remaining)[0];
-      
-      if (smallestItem) {
-        currentCut.blocks[smallestItem.size] = 1;
-        currentCut.stackSize = smallestItem.remaining;
-        smallestItem.remaining = 0;
-      } else {
-        // No items remaining, we're done
-        break;
-      }
-    }
-    
+    // Add this cut to the plan
     cuttingPlan.push(currentCut);
+    
+    // Verify we're making progress
+    const totalRemaining = orderItems.reduce((sum, item) => sum + item.remaining, 0);
+    if (totalRemaining === totalOrderQuantity) {
+      // We didn't make any progress, force progress on the largest remaining item
+      const largestItem = orderItems
+        .filter(item => item.remaining > 0)
+        .sort((a, b) => b.remaining - a.remaining)[0];
+      
+      if (largestItem) {
+        // Create a special cut just for this item
+        cutNumber++;
+        const specialCut = {
+          cutNumber,
+          stackSize: Math.min(largestItem.remaining, maxStackingCloth),
+          blocks: { [largestItem.size]: 1 }
+        };
+        
+        // Update remaining
+        largestItem.remaining -= specialCut.stackSize;
+        
+        // Add to cutting plan
+        cuttingPlan.push(specialCut);
+      }
+    }
+  }
+
+  // Double-check that all orders are fulfilled
+  // If not, add additional cuts to fulfill remaining orders
+  for (const item of orderItems) {
+    while (item.remaining > 0) {
+      cutNumber++;
+      
+      // Create a cut specifically for this remaining item
+      const stackSize = Math.min(item.remaining, maxStackingCloth);
+      const specialCut = {
+        cutNumber,
+        stackSize,
+        blocks: { [item.size]: 1 }
+      };
+      
+      // Update remaining
+      item.remaining -= stackSize;
+      
+      // Add to cutting plan
+      cuttingPlan.push(specialCut);
+    }
   }
 
   // Generate summary
@@ -188,6 +174,20 @@ export function optimizeGarmentCutting(req, res) {
     for (const [size, blocks] of Object.entries(cut.blocks)) {
       production[size] = (production[size] || 0) + (blocks * cut.stackSize);
     }
+  }
+
+  // Verify all orders are fulfilled
+  let allOrdersFulfilled = true;
+  for (const [size, quantity] of Object.entries(orders)) {
+    const produced = production[size] || 0;
+    if (produced < quantity) {
+      console.error(`Error: Not enough ${size} produced. Ordered: ${quantity}, Produced: ${produced}`);
+      allOrdersFulfilled = false;
+    }
+  }
+
+  if (!allOrdersFulfilled) {
+    console.error("Warning: Not all orders were fulfilled in the cutting plan");
   }
 
   // Calculate waste (overproduction)
@@ -217,6 +217,15 @@ export function optimizeGarmentCutting(req, res) {
     ? Math.round(((totalClothUsed - totalWaste) / totalClothUsed) * 100)
     : 100;
 
+  // Add production quantities to the response for verification
+  const productionVerification = {};
+  for (const [size, quantity] of Object.entries(orders)) {
+    productionVerification[size] = {
+      ordered: quantity,
+      produced: production[size] || 0
+    };
+  }
+
   res.status(200).json({
     totalOrderQuantity,
     totalCuts: cuttingPlan.length,
@@ -225,6 +234,7 @@ export function optimizeGarmentCutting(req, res) {
     stackUtilizationPercent,
     clothEfficiencyPercent,
     totalWaste,
-    summary
+    summary,
+    productionVerification // Added for debugging
   });
 }
